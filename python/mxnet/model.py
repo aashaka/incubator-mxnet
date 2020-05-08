@@ -122,14 +122,15 @@ def _create_kvstore(kvstore, num_device, arg_params):
 
     return (kv, update_on_kvstore)
 
-def _initialize_kvstore(kvstore, param_arrays, arg_params, param_names, update_on_kvstore):
+def _initialize_kvstore(kvstore, param_arrays, arg_params, param_names, update_on_kvstore, epoch=0, server_epochs=[]):
     """Initialize kvstore"""
     for idx, param_on_devs in enumerate(param_arrays):
         name = param_names[idx]
         if not update_on_kvstore or arg_params[name].stype != 'default':
             kvstore.init(name, arg_params[name])
         else:
-            kvstore.broadcast(name, arg_params[name], out=param_on_devs)
+            print("This shouldn't print")
+            kvstore.broadcast(name, arg_params[name], out=param_on_devs, epoch=epoch, server_epochs=server_epochs)
 
 def _update_params_on_kvstore_nccl(param_arrays, grad_arrays, kvstore, param_names):
     """Perform update of param_arrays from grad_arrays on NCCL kvstore."""

@@ -24,6 +24,7 @@ from .. import optimizer as opt
 from ..model import _create_kvstore, _create_sparse_kvstore
 from .parameter import ParameterDict, Parameter
 from ..kvstore import KVStore
+from .. import nd
 
 
 class Trainer(object):
@@ -115,6 +116,8 @@ class Trainer(object):
         self._kvstore_params = {'kvstore': kvstore, 'update_on_kvstore': update_on_kvstore}
         self._kv_initialized = False
         self._kvstore = None
+        self.epoch = 0
+        self.server_epochs = []
         self._update_on_kvstore = None
         self._distributed = None
         self._params_to_init = []
@@ -157,6 +160,8 @@ class Trainer(object):
                                      "when KVStore is not initialized."
         params_to_init = []
         if self._kvstore:
+            self.server_epochs = nd.zeros(self._kvstore.num_workers)
+            # print(self.epoch, self.server_epochs)
             for param in self._params_to_init:
                 if param._deferred_init:
                     params_to_init.append(param)
@@ -166,7 +171,9 @@ class Trainer(object):
                     if param._stype != 'default':
                         self._kvstore.init(idx, param_arrays[0])
                     else:
-                        self._kvstore.broadcast(idx, param_arrays[0], param_arrays)
+                        # sepochs = self.server_epochs
+                        # print("sepoch ", sepochs)
+                        self._kvstore.broadcast(idx, param_arrays[0], param_arrays)#, self.epoch, self.server_epochs)
 
         self._params_to_init = params_to_init
 
@@ -326,7 +333,7 @@ class Trainer(object):
                                   'is used.')
         self._optimizer.rescale_grad = scale
 
-    def step(self, batch_size, ignore_stale_grad=False):
+    def step(self, batch_size, ignore_stale_grad=False, epoch=0):
         """Makes one step of parameter update. Should be called after
         `autograd.backward()` and outside of `record()` scope.
 
@@ -344,14 +351,14 @@ class Trainer(object):
             If true, ignores Parameters with stale gradient (gradient that has not
             been updated by `backward` after last step) and skip update.
         """
+        print("inside step")
         rescale_grad = self._scale / batch_size
         self._check_and_rescale_grad(rescale_grad)
-
+        self.epoch = epoch
         if not self._kv_initialized:
             self._init_kvstore()
         if self._params_to_init:
             self._init_params()
-
         self._allreduce_grads()
         self._update(ignore_stale_grad)
 
@@ -378,9 +385,11 @@ class Trainer(object):
         self._allreduce_grads()
 
     def _allreduce_grads(self):
+        print("inside all reduce")
         # nothing to reduce
         if not self._kvstore:
             return
+        print("+++++++++++++++++++++++++++++++++",len(self._params))
         for i, param in enumerate(self._params):
             if param.grad_req != 'null':
 
@@ -398,8 +407,13 @@ class Trainer(object):
                 else:
                     # allreduce dense gradients if not update_on_kvstore,
                     # otherwise push dense gradients, pull dense weights
+                    sepochs=self.server_epochs
+                    # print("Self serverepochs", self.server_epochs)
                     if self._update_on_kvstore:
-                        self._kvstore.pushpull(i, grad_list, out=param.list_data(), priority=-i)
+                        self._kvstore.pushpull(i, grad_list, out=param.list_data(), priority=-i, epoch=self.epoch, server_epochs=self.server_epochs, out_server_epochs=sepochs)
+                        if (sepochs):
+                            self.server_epochs = sepochs
+                            print("sepch updated", sepochs.asnumpy())
                     else:
                         self._kvstore.pushpull(i, grad_list, priority=-i)
 

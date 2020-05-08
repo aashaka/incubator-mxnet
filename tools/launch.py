@@ -97,9 +97,9 @@ def main():
         args.num_servers = args.num_workers
     if args.p3:
         args.command = ['DMLC_PS_VAN_TYPE=p3 DMLC_PS_WATER_MARK=10'] + args.command
-
+    print(args)
     args = dmlc_opts(args)
-
+    
     if args.host_file is None or args.host_file == 'None':
         if args.cluster == 'yarn':
             from dmlc_tracker import yarn
@@ -115,6 +115,7 @@ def main():
     else:
         if args.cluster == 'ssh':
             from dmlc_tracker import ssh
+            print(args)
             ssh.submit(args)
         elif args.cluster == 'mpi':
             from dmlc_tracker import mpi

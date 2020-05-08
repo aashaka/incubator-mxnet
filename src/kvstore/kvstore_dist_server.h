@@ -38,6 +38,7 @@
 #include "../profiler/profiler.h"
 #include "../operator/tensor/elemwise_binary_op-inl.h"
 #include "../operator/tensor/init_op.h"
+#define MAX_WORKERS 20
 
 namespace mxnet {
 namespace kvstore {
@@ -163,6 +164,7 @@ class KVStoreDistServer {
         std::bind(&KVStoreDistServer::DataHandleEx, this, _1, _2, _3));
     sync_mode_ = false;
     gradient_compression_ = std::make_shared<GradientCompression>();
+    clock_ = ps::SArray<int>(MAX_WORKERS);
     log_verbose_ = dmlc::GetEnv("MXNET_KVSTORE_DIST_ROW_SPARSE_VERBOSE", false);
   }
 
@@ -345,20 +347,37 @@ class KVStoreDistServer {
 
   inline void ApplyUpdates(const DataHandleType type, const int key,
                            const ps::KVPairs<char>& req_data, UpdateBuf *update_buf,
-                           ps::KVServer<char>* server) {
+                           ps::KVServer<char>* server, int worker=-1, int worker_epoch=0,
+                           ps::SArray<int> worker_server_clock = {}) {
+      std::cout<<"In ApplyUpdates"<<std::endl;
     if (!sync_mode_ || update_buf->request.size() == (size_t) ps::NumWorkers()) {
       // let the main thread to execute updater_, which is necessary for python
       auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
       auto& update =  sync_mode_ ? update_buf->merged : update_buf->temp_array;
       if (updater_) {
+        std::cout<<"Updater has been defined"<<std::endl;
+        int staleness = 0;
+        for (int i=0; i<worker_server_clock.size(); i++) {
+          std::cout<<clock_[i]<<" "<<worker_server_clock[i]<<std::endl;
+          staleness += clock_[i] - worker_server_clock[i];
+        }
+        std::cout<<"Staleness: "<<staleness<<std::endl;
         exec_.Exec([this, key, &update, &stored](){
           CHECK(updater_);
+          // TODO Divide update by staleness here.
           updater_(key, update, &stored);
         });
       } else {
         CHECK(sync_mode_) << "Updater needs to be set for async mode";
         // if no updater, just copy
         CopyFromTo(update_buf->merged, &stored);
+      }
+
+      std::cout<<"updating server clock"<<std::endl;
+      if (worker == -1) {
+        std::cout<<"No worker was set"<<std::endl;
+      } else {
+        clock_[worker] = (worker_epoch>clock_[worker]) ? worker_epoch : clock_[worker];
       }
 
       if (log_verbose_)  {
@@ -374,16 +393,27 @@ class KVStoreDistServer {
         has_pull = has_pull || req.pull;
       }
       if (has_pull) {
+        std::cout<<"This is pushpull."<<std::endl;
         // if there is a pull request, perform WaitToRead() once before DefaultStorageResponse
         if (has_multi_precision_copy(type)) CopyFromTo(stored, store_[key]);
         stored.WaitToRead();
         for (const auto& req : update_buf->request) {
           if (req.pull) {
-            DefaultStorageResponse(type, key, req, req_data, server);
+            auto getNewMeta = [this, req, worker_server_clock]() {
+              ps::KVMeta new_req = req;
+              for (int i=0; i<worker_server_clock.size(); i++) {
+                new_req.server_epochs[i] = clock_[i];
+              }
+              return new_req;
+            };
+            const ps::KVMeta new_req = getNewMeta();
+            std::cout<<"Sending updated value of clock"<<std::endl;
+            DefaultStorageResponse(type, key, new_req, req_data, server);
           }
         }
         update_buf->request.clear();
       } else {
+        std::cout<<"That was only a push"<<std::endl;
         // otherwise, send response directly
         for (const auto& req : update_buf->request) {
           server->Response(req);
@@ -607,19 +637,26 @@ class KVStoreDistServer {
                               const ps::KVMeta& req_meta,
                               const ps::KVPairs<char> &req_data,
                               ps::KVServer<char>* server) {
+    std::cout<<"DefaultStorageResponse"<<std::endl;
     ps::KVPairs<char> response;
+    // std::cout<<"DefaultStorageResponse1"<<std::endl;
     const NDArray& stored = store_[key];
+    // std::cout<<"DefaultStorageResponse2"<<std::endl;
     CHECK(!stored.is_none()) << "init " << key << " first";
 
     // as server returns when store_realt is ready in this case
     if (has_multi_precision_copy(type)) stored.WaitToRead();
+    // std::cout<<"DefaultStorageResponse3"<<std::endl;
 
     auto len = stored.shape().Size() * mshadow::mshadow_sizeof(stored.dtype());
     response.keys = req_data.keys;
     response.lens = {len};
+    // std::cout<<"DefaultStorageResponse4"<<std::endl;
     // TODO(mli) try to remove this CopyFrom
     response.vals.CopyFrom(static_cast<const char*>(stored.data().dptr_), len);
+    // std::cout<<"DefaultStorageResponse5"<<std::endl;
     server->Response(req_meta, response);
+    std::cout<<"DefaultStorageResponse6"<<std::endl;
   }
 
   void DataHandleCompressed(const DataHandleType type,
@@ -702,10 +739,16 @@ class KVStoreDistServer {
     }
     int key = DecodeKey(req_data.keys[0]);
     auto& stored = has_multi_precision_copy(type) ? store_realt_[key] : store_[key];
+    int worker = req_meta.rank;
+    int worker_epoch = req_meta.epoch;
+    ps::SArray<int> worker_clock = req_meta.server_epochs;
+    std::cout<<"worker_clock length is "<<worker_clock.size()<<std::endl;
     // there used several WaitToRead, this is because \a recved's memory
     // could be deallocated when this function returns. so we need to make sure
     // the operators with \a NDArray are actually finished
     if (req_meta.push) {
+      std::cout<<"worker: "<<worker<<" epoch: "<<worker_epoch<<std::endl;
+      std::cout<<"Size of clock_ : "<<clock_.size()<<std::endl;
       size_t ds[] = {(size_t) req_data.lens[0] / mshadow::mshadow_sizeof(type.dtype)};
       mxnet::TShape dshape(ds, ds + 1);
       TBlob recv_blob;
@@ -713,7 +756,9 @@ class KVStoreDistServer {
         recv_blob = TBlob(reinterpret_cast<DType*>(req_data.vals.data()), dshape, cpu::kDevMask);
       })
       NDArray recved = NDArray(recv_blob, 0);
+      std::cout<<"Processesing push 1"<<std::endl;
       if (stored.is_none()) {
+        std::cout<<"none stored push 2"<<std::endl;
         // initialization
         stored = NDArray(dshape, Context(), false,
                          has_multi_precision_copy(type) ? mshadow::kFloat32 : type.dtype);
@@ -725,8 +770,10 @@ class KVStoreDistServer {
           CopyFromTo(stored, stored_dtype);
           stored_dtype.WaitToRead();
         }
+        clock_[worker] = (worker_epoch>clock_[worker]) ? worker_epoch : clock_[worker];
         stored.WaitToRead();
       } else {
+        std::cout<<"stored push 3"<<std::endl;
         auto &updates = update_buf_[key];
         if (sync_mode_ && updates.merged.is_none()) {
           updates.merged = NDArray(dshape, Context(), false,
@@ -754,10 +801,12 @@ class KVStoreDistServer {
             updates.merged += recved;
           }
         }
+        std::cout<<"pushing request push 4"<<std::endl;
         updates.request.push_back(req_meta);
-        ApplyUpdates(type, key, req_data, &updates, server);
+        ApplyUpdates(type, key, req_data, &updates, server, worker, worker_epoch, worker_clock);
       }
     } else {
+      std::cout<<"Server pull, calling defstorageresp 1"<<std::endl;
       DefaultStorageResponse(type, key, req_meta, req_data, server);
     }
   }
@@ -780,6 +829,11 @@ class KVStoreDistServer {
    */
   std::unordered_map<int, NDArray> store_;
   std::unordered_map<int, NDArray> store_realt_;
+
+  /**
+   * \brief clock_ contains the value of last serviced worker iteration
+   */
+  ps::SArray<int> clock_;
 
   /**
    * \brief merge_buf_ is a buffer used if sync_mode is true. It represents

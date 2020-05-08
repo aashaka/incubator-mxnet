@@ -488,6 +488,7 @@ class Module(BaseModule):
             Default ``False``, indicating whether we should force re-initializing the
             optimizer in the case an optimizer is already installed.
         """
+        print("doing initKV")
         assert self.binded and self.params_initialized
 
         if self.optimizer_initialized and not force_init:
@@ -504,7 +505,7 @@ class Module(BaseModule):
         if kvstore and 'dist' in kvstore.type and '_sync' in kvstore.type:
             batch_size *= kvstore.num_workers
         rescale_grad = 1.0/batch_size
-
+        self.server_epochs = [0]*kvstore.num_workers
         idx2name = {}
         if update_on_kvstore:
             idx2name.update(enumerate(self._exec_group.param_names))
